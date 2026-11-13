@@ -227,6 +227,8 @@ typedef struct ndpi_flow_info {
 
   // result only, not used for flow identification
   ndpi_protocol detected_protocol;
+  ndpi_protocol cached_detected_protocol;
+  u_int8_t protocol_cache_valid;
   ndpi_confidence_t confidence;
   u_int16_t num_dissector_calls;
   u_int16_t dpi_packets;
@@ -379,6 +381,48 @@ typedef struct ndpi_flow_info {
   char *flow_payload;
 } ndpi_flow_info_t;
 
+/* Flow table lookup key. Keep in sync with ndpi_workflow_node_cmp(). */
+typedef struct {
+  u_int32_t src_ip;
+  u_int32_t dst_ip;
+  u_int16_t src_port;
+  u_int16_t dst_port;
+  u_int16_t vlan_id;
+  u_int8_t protocol;
+} ndpi_flow_table_key;
+
+struct ndpi_flow_table;
+
+typedef void (*ndpi_flow_table_walker)(const void *node, ndpi_VISIT which,
+				       int depth, void *user_data);
+
+struct ndpi_flow_table *ndpi_flow_table_init(u_int32_t num_shards);
+void ndpi_flow_table_free(struct ndpi_flow_table *table,
+			  void (*free_flow)(void *node));
+struct ndpi_flow_info *ndpi_flow_table_find(struct ndpi_flow_table *table,
+					    const ndpi_flow_table_key *key);
+int ndpi_flow_table_insert(struct ndpi_flow_table *table,
+			   struct ndpi_flow_info *flow);
+int ndpi_flow_table_remove(struct ndpi_flow_table *table,
+			   struct ndpi_flow_info *flow);
+void ndpi_flow_table_walk_shard(struct ndpi_flow_table *table, u_int32_t shard,
+				ndpi_flow_table_walker walker, void *user_data);
+void ndpi_flow_table_walk(struct ndpi_flow_table *table,
+			  ndpi_flow_table_walker walker, void *user_data);
+
+struct ndpi_flow_table_stats {
+  u_int64_t lookups;
+  u_int64_t probes;
+  u_int64_t inserts;
+  u_int64_t resizes;
+  u_int64_t memory_bytes;
+  u_int32_t entries;
+  u_int32_t shards;
+};
+
+void ndpi_flow_table_get_stats(struct ndpi_flow_table *table,
+			       struct ndpi_flow_table_stats *stats);
+
 
 // flow statistics info
 typedef struct ndpi_stats {
@@ -400,6 +444,7 @@ typedef struct ndpi_stats {
   u_int64_t breed_counter_bytes[NDPI_NUM_BREEDS];
   u_int32_t breed_flows[NDPI_NUM_BREEDS];
   u_int32_t ndpi_flow_count;
+  u_int64_t protocol_cache_hits;
   u_int32_t flow_count[3];
   u_int64_t tcp_count, udp_count;
   u_int64_t mpls_count, pppoe_count, vlan_count, fragmented_count;
@@ -446,7 +491,7 @@ typedef struct ndpi_workflow {
   pcap_t *pcap_handle;
 
   /* allocated by prefs */
-  void **ndpi_flows_root;
+  struct ndpi_flow_table *ndpi_flows;
   struct ndpi_detection_module_struct *ndpi_struct;
   struct ndpi_global_context *g_ctx;
   u_int32_t num_allocated_flows;
@@ -493,6 +538,15 @@ int ndpi_is_datalink_supported(int datalink_type);
 
 /* compare two nodes in workflow */
 int ndpi_workflow_node_cmp(const void *a, const void *b);
+void ndpi_workflow_walk_flows(struct ndpi_workflow *workflow,
+			      ndpi_flow_table_walker walker, void *user_data);
+void ndpi_workflow_walk_flows_shard(struct ndpi_workflow *workflow,
+				    u_int32_t shard,
+				    ndpi_flow_table_walker walker,
+				    void *user_data);
+int ndpi_workflow_remove_flow(struct ndpi_workflow *workflow,
+			      struct ndpi_flow_info *flow);
+void ndpi_workflow_clear_flows(struct ndpi_workflow *workflow);
 void process_ndpi_collected_info(struct ndpi_workflow * workflow, struct ndpi_flow_info *flow);
 char *reader_flow_risk_info(const struct ndpi_flow_info *flow, char *out, u_int out_len);
 void ndpi_flow_info_free_data(struct ndpi_flow_info *flow);

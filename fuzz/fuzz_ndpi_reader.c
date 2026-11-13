@@ -83,7 +83,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
   struct pcap_pkthdr *header;
   int r;
   char errbuf[PCAP_ERRBUF_SIZE];
-  u_int i;
   FILE *fd;
   char name[256];
 
@@ -219,11 +218,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
   }
 
   workflow->pcap_handle = pkts;
-  /* Init flow tree */
-  workflow->ndpi_flows_root = ndpi_calloc(workflow->prefs.num_roots, sizeof(void *));
-  if(!workflow->ndpi_flows_root) {
-    pcap_close(pkts);
-    return 0;
+  /* Init flow table */
+  if(workflow->ndpi_flows == NULL) {
+    workflow->ndpi_flows = ndpi_flow_table_init(workflow->prefs.num_roots);
+    if(!workflow->ndpi_flows) {
+      pcap_close(pkts);
+      return 0;
+    }
   }
 
 #ifdef ENABLE_NALLOC
@@ -250,12 +251,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
   }
   pcap_close(pkts);
 
-  /* Free flow trees */
-  for(i = 0; i < workflow->prefs.num_roots; i++) {
-    ndpi_twalk(workflow->ndpi_flows_root[i], node_cleanup_walker, NULL);
-    ndpi_tdestroy(workflow->ndpi_flows_root[i], ndpi_flow_info_freer);
-  }
-  ndpi_free(workflow->ndpi_flows_root);
+  /* Finalize and free flows, then allocate a fresh table for the next input */
+  ndpi_workflow_walk_flows(workflow, node_cleanup_walker, NULL);
+  ndpi_workflow_clear_flows(workflow);
   /* Free payload analyzer data */
   if(enable_payload_analyzer)
     ndpi_report_payload_stats(stdout);

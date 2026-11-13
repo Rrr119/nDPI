@@ -7,11 +7,11 @@ VPATH = @srcdir@
 CFLAGS=@CFLAGS@
 AM_CFLAGS=@NDPI_CFLAGS@
 
-INC=-I $(top_srcdir)/src/include/ -I $(top_builddir)/src/include/ -I $(top_srcdir)/src/lib/third_party/include/
+INC=-I $(top_srcdir)/src/include/ -I $(top_builddir)/src/include/ -I $(top_srcdir)/src/lib/third_party/include/ -I $(top_srcdir)/example/
 LIB=$(top_builddir)/src/lib/libndpi.a @ADDITIONAL_LIBS@ @LIBS@
 GEN_HEADERS=$(top_builddir)/src/include/ndpi_config.h $(top_builddir)/src/include/ndpi_define.h
 
-TOOLS=substringsearch patriciasearch gcrypt-int gcrypt-gnu strnstr
+TOOLS=substringsearch patriciasearch gcrypt-int gcrypt-gnu strnstr flow_table_bench
 TESTS=substring_test patricia_test strnstr_test geo_test
 
 
@@ -50,6 +50,12 @@ patriciasearch: $(srcdir)/patriciasearch.c Makefile $(GEN_HEADERS)
 
 patricia_test: patriciasearch blacklist-ip.txt
 	./patriciasearch
+
+flow_table_bench: $(srcdir)/flow_table_bench.c $(top_srcdir)/example/flow_table.c Makefile $(GEN_HEADERS)
+	$(CC) $(INC) $(AM_CFLAGS) $(CFLAGS) $(srcdir)/flow_table_bench.c $(top_srcdir)/example/flow_table.c -o flow_table_bench $(LIB)
+
+flow_table_test: flow_table_bench
+	./flow_table_bench --verify
 
 
 # Top 1 Million domains (NetAPI Top 1M, CC BY 4.0; the Alexa list is gone)

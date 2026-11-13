@@ -452,6 +452,7 @@ void ndpi_stats_reset(ndpi_stats_t *s) {
   s->total_ip_bytes = 0;
   s->total_discarded_bytes = 0;
   s->ndpi_flow_count = 0;
+  s->protocol_cache_hits = 0;
   s->tcp_count = 0;
   s->udp_count = 0;
   s->mpls_count = 0;
@@ -512,9 +513,9 @@ struct ndpi_workflow* ndpi_workflow_init(const struct ndpi_workflow_prefs * pref
   ndpi_set_user_data(module, workflow);
 
   if(do_init_flows_root) {
-    workflow->ndpi_flows_root = ndpi_calloc(workflow->prefs.num_roots, sizeof(void *));
+    workflow->ndpi_flows = ndpi_flow_table_init(workflow->prefs.num_roots);
 
-    if(!workflow->ndpi_flows_root) {
+    if(!workflow->ndpi_flows) {
       ndpi_exit_detection_module(module);
       ndpi_free(workflow);
       return NULL;
@@ -680,16 +681,12 @@ void ndpi_flow_info_free_data(struct ndpi_flow_info *flow) {
 /* ***************************************************** */
 
 void ndpi_workflow_free(struct ndpi_workflow * workflow) {
-  u_int i;
-
-  for(i=0; i<workflow->prefs.num_roots; i++)
-    ndpi_tdestroy(workflow->ndpi_flows_root[i], ndpi_flow_info_freer);
+  ndpi_flow_table_free(workflow->ndpi_flows, ndpi_flow_info_freer);
 
   if(addr_dump_path != NULL)
     ndpi_cache_address_dump(workflow->ndpi_struct, addr_dump_path, 0);
 
   ndpi_exit_detection_module(workflow->ndpi_struct);
-  ndpi_free(workflow->ndpi_flows_root);
 
   ndpi_stats_free(&workflow->stats);
 
@@ -723,6 +720,36 @@ int ndpi_workflow_node_cmp(const void *a, const void *b) {
   r = cmp_n16(fa->dst_port, fb->dst_port);
 
   return(r);
+}
+
+/* ***************************************************** */
+
+void ndpi_workflow_walk_flows_shard(struct ndpi_workflow *workflow,
+				    u_int32_t shard,
+				    ndpi_flow_table_walker walker,
+				    void *user_data) {
+  ndpi_flow_table_walk_shard(workflow->ndpi_flows, shard, walker, user_data);
+}
+
+/* ***************************************************** */
+
+void ndpi_workflow_walk_flows(struct ndpi_workflow *workflow,
+			      ndpi_flow_table_walker walker, void *user_data) {
+  ndpi_flow_table_walk(workflow->ndpi_flows, walker, user_data);
+}
+
+/* ***************************************************** */
+
+int ndpi_workflow_remove_flow(struct ndpi_workflow *workflow,
+			      struct ndpi_flow_info *flow) {
+  return ndpi_flow_table_remove(workflow->ndpi_flows, flow);
+}
+
+/* ***************************************************** */
+
+void ndpi_workflow_clear_flows(struct ndpi_workflow *workflow) {
+  ndpi_flow_table_free(workflow->ndpi_flows, ndpi_flow_info_freer);
+  workflow->ndpi_flows = ndpi_flow_table_init(workflow->prefs.num_roots);
 }
 
 /* ***************************************************** */
@@ -827,9 +854,9 @@ static struct ndpi_flow_info *get_ndpi_flow_info(struct ndpi_workflow * workflow
 						 u_int16_t *payload_len,
 						 u_int8_t *src_to_dst_direction,
                                                  pkt_timeval when) {
-  u_int32_t idx, hashval;
-  struct ndpi_flow_info flow;
-  void *ret;
+  u_int32_t hashval;
+  ndpi_flow_table_key flow_key;
+  struct ndpi_flow_info *ret;
   const u_int8_t *l3, *l4;
   u_int32_t l4_data_len = 0XFEEDFACE;
 
@@ -912,42 +939,27 @@ static struct ndpi_flow_info *get_ndpi_flow_info(struct ndpi_workflow * workflow
     l4_data_len = 0;
   }
 
-  flow.protocol = iph->protocol, flow.vlan_id = vlan_id;
-  flow.src_ip = iph->saddr, flow.dst_ip = iph->daddr;
-  flow.src_port = htons(*sport), flow.dst_port = htons(*dport);
-  flow.hashval = hashval = flow.protocol + ntohl(flow.src_ip) + ntohl(flow.dst_ip)
-    + ntohs(flow.src_port) + ntohs(flow.dst_port);
+  flow_key.protocol = iph->protocol, flow_key.vlan_id = vlan_id;
+  flow_key.src_ip = iph->saddr, flow_key.dst_ip = iph->daddr;
+  flow_key.src_port = htons(*sport), flow_key.dst_port = htons(*dport);
+  hashval = flow_key.protocol + ntohl(flow_key.src_ip) + ntohl(flow_key.dst_ip)
+    + ntohs(flow_key.src_port) + ntohs(flow_key.dst_port);
 
 #if 0
   {
   char ip1[48],ip2[48];
-       inet_ntop(AF_INET, &flow.src_ip, ip1, sizeof(ip1));
-       inet_ntop(AF_INET, &flow.dst_ip, ip2, sizeof(ip2));
-  printf("hashval=%u [%u][%u][%s:%u][%s:%u]\n", hashval, flow.protocol, flow.vlan_id,
-        ip1, ntohs(flow.src_port),  ip2, ntohs(flow.dst_port));
+       inet_ntop(AF_INET, &flow_key.src_ip, ip1, sizeof(ip1));
+       inet_ntop(AF_INET, &flow_key.dst_ip, ip2, sizeof(ip2));
+  printf("hashval=%u [%u][%u][%s:%u][%s:%u]\n", hashval, flow_key.protocol, flow_key.vlan_id,
+        ip1, ntohs(flow_key.src_port),  ip2, ntohs(flow_key.dst_port));
   }
 #endif
 
-  idx = hashval % workflow->prefs.num_roots;
-  ret = ndpi_tfind(&flow, &workflow->ndpi_flows_root[idx], ndpi_workflow_node_cmp);
+  ret = ndpi_flow_table_find(workflow->ndpi_flows, &flow_key);
 
-  /* to avoid two nodes in one binary tree for a flow */
-  int is_changed = 0;
-  if(ret == NULL) {
-    u_int32_t orig_src_ip = flow.src_ip;
-    u_int16_t orig_src_port = flow.src_port;
-    u_int32_t orig_dst_ip = flow.dst_ip;
-    u_int16_t orig_dst_port = flow.dst_port;
-
-    flow.src_ip = orig_dst_ip;
-    flow.src_port = orig_dst_port;
-    flow.dst_ip = orig_src_ip;
-    flow.dst_port = orig_src_port;
-
-    is_changed = 1;
-
-    ret = ndpi_tfind(&flow, &workflow->ndpi_flows_root[idx], ndpi_workflow_node_cmp);
-  }
+  int is_changed = ret != NULL &&
+    !(ret->src_ip == flow_key.src_ip && ret->src_port == flow_key.src_port &&
+      ret->dst_ip == flow_key.dst_ip && ret->dst_port == flow_key.dst_port);
 
   if(ret == NULL) {
     if(workflow->stats.ndpi_flow_count == workflow->prefs.max_ndpi_flows) {
@@ -1030,7 +1042,7 @@ static struct ndpi_flow_info *get_ndpi_flow_info(struct ndpi_workflow * workflow
       }
     }
 
-      if(ndpi_tsearch(newflow, &workflow->ndpi_flows_root[idx], ndpi_workflow_node_cmp) == NULL) { /* Add */
+      if(ndpi_flow_table_insert(workflow->ndpi_flows, newflow) != 0) {
         ndpi_flow_info_free_data(newflow);
         ndpi_free(newflow);
         return(NULL);
@@ -1047,7 +1059,7 @@ static struct ndpi_flow_info *get_ndpi_flow_info(struct ndpi_workflow * workflow
         newflow->entropy = ndpi_calloc(1, sizeof(struct ndpi_entropy));
         newflow->last_entropy = ndpi_calloc(1, sizeof(struct ndpi_entropy));
         if(!newflow->entropy || !newflow->last_entropy) {
-          ndpi_tdelete(newflow, &workflow->ndpi_flows_root[idx], ndpi_workflow_node_cmp);
+          ndpi_flow_table_remove(workflow->ndpi_flows, newflow);
           ndpi_flow_info_free_data(newflow);
           ndpi_free(newflow);
           return(NULL);
@@ -1067,7 +1079,7 @@ static struct ndpi_flow_info *get_ndpi_flow_info(struct ndpi_workflow * workflow
       return newflow;
     }
   } else {
-    struct ndpi_flow_info *rflow = *(struct ndpi_flow_info**)ret;
+    struct ndpi_flow_info *rflow = ret;
 
     if(is_changed) {
 	*src_to_dst_direction = 0, rflow->bidirectional |= 1;
@@ -2175,7 +2187,10 @@ static struct ndpi_proto packet_processing(struct ndpi_workflow * workflow,
     return(nproto);
   }
 
-  if(!flow->detection_completed) {
+  if(flow->protocol_cache_valid) {
+    workflow->stats.protocol_cache_hits++;
+    flow->current_pkt_from_client_to_server = NDPI_IN_PKT_DIR_UNKNOWN;
+  } else {
     struct ndpi_flow_input_info input_info;
 
     u_int enough_packets =
@@ -2229,14 +2244,14 @@ static struct ndpi_proto packet_processing(struct ndpi_workflow * workflow,
 
       if(flow->ndpi_flow->core.protocol_was_guessed) workflow->stats.guessed_flow_protocols++;
       process_ndpi_collected_info(workflow, flow);
+      flow->cached_detected_protocol = flow->detected_protocol;
+      flow->protocol_cache_valid = 1;
     }
 
     /* Let's try to save client-server direction */
     flow->current_pkt_from_client_to_server = input_info.in_pkt_dir;
 
     alloc_size_stats = 0;
-  } else {
-    flow->current_pkt_from_client_to_server = NDPI_IN_PKT_DIR_UNKNOWN; /* Unknown */
   }
 
 #if 0
@@ -2253,7 +2268,10 @@ static struct ndpi_proto packet_processing(struct ndpi_workflow * workflow,
   *flow_risk = flow->risk;
   *flow_ext = flow;
 
-  return(flow->detected_protocol);
+  nproto = flow->protocol_cache_valid ?
+    flow->cached_detected_protocol : flow->detected_protocol;
+
+  return(nproto);
 }
 
 /* ****************************************************** */

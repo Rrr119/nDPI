@@ -290,6 +290,8 @@ struct reader_thread {
   u_int32_t idle_scan_idx;
   u_int32_t num_idle_flows;
   struct ndpi_flow_info *idle_flows[IDLE_SCAN_BUDGET];
+  u_int8_t *packet_scratch;
+  u_int32_t packet_scratch_capacity;
 };
 
 // array for every thread created for a flow
@@ -3590,6 +3592,9 @@ static void setupDetection(u_int16_t thread_id, pcap_t * pcap_handle,
 static void terminateDetection(u_int16_t thread_id) {
   ndpi_workflow_free(ndpi_thread_info[thread_id].workflow);
   ndpi_thread_info[thread_id].workflow = NULL;
+  ndpi_free(ndpi_thread_info[thread_id].packet_scratch);
+  ndpi_thread_info[thread_id].packet_scratch = NULL;
+  ndpi_thread_info[thread_id].packet_scratch_capacity = 0;
 }
 
 /* *********************************************** */
@@ -3760,8 +3765,8 @@ static void printRiskStats() {
 
     for(thread_id = 0; thread_id < num_threads; thread_id++) {
       for(i=0; i<NUM_ROOTS; i++)
-        ndpi_twalk(ndpi_thread_info[thread_id].workflow->ndpi_flows_root[i],
-		   node_flow_risk_walker, &thread_id);
+        ndpi_workflow_walk_flows_shard(ndpi_thread_info[thread_id].workflow, i,
+				       node_flow_risk_walker, &thread_id);
     }
 
     if(risks_found) {
@@ -3860,8 +3865,8 @@ static void printFlowsStats() {
     num_flows = 0;
     for(thread_id = 0; thread_id < num_threads; thread_id++) {
       for(i=0; i<NUM_ROOTS; i++)
-        ndpi_twalk(ndpi_thread_info[thread_id].workflow->ndpi_flows_root[i],
-                   node_print_known_proto_walker, &thread_id);
+        ndpi_workflow_walk_flows_shard(ndpi_thread_info[thread_id].workflow, i,
+				       node_print_known_proto_walker, &thread_id);
     }
 
     if((verbose == 2) || (verbose == 3)) {
@@ -4452,8 +4457,8 @@ static void printFlowsStats() {
       if(ndpi_thread_info[thread_id].workflow->stats.protocol_counter[0] > 0 ||
          (dump_fpc_stats && ndpi_thread_info[thread_id].workflow->stats.fpc_protocol_counter[0] > 0)) {
         for(i=0; i<NUM_ROOTS; i++)
-          ndpi_twalk(ndpi_thread_info[thread_id].workflow->ndpi_flows_root[i],
-                     node_print_unknown_proto_walker, &thread_id);
+          ndpi_workflow_walk_flows_shard(ndpi_thread_info[thread_id].workflow, i,
+					 node_print_unknown_proto_walker, &thread_id);
       }
     }
 
@@ -4467,8 +4472,8 @@ static void printFlowsStats() {
     num_flows = 0;
     for(thread_id = 0; thread_id < num_threads; thread_id++) {
       for(i=0; i<NUM_ROOTS; i++)
-        ndpi_twalk(ndpi_thread_info[thread_id].workflow->ndpi_flows_root[i],
-                   node_print_known_proto_walker, &thread_id);
+        ndpi_workflow_walk_flows_shard(ndpi_thread_info[thread_id].workflow, i,
+				       node_print_known_proto_walker, &thread_id);
     }
 
     for(i=0; i<num_flows; i++)
@@ -4483,10 +4488,10 @@ static void printFlowsStats() {
       num_flows = 0;
       for(thread_id = 0; thread_id < num_threads; thread_id++) {
 	for(i = 0; i < NUM_ROOTS; i++) {
-	  ndpi_twalk(ndpi_thread_info[thread_id].workflow->ndpi_flows_root[i],
-		     node_print_known_proto_walker, &thread_id);
-	  ndpi_twalk(ndpi_thread_info[thread_id].workflow->ndpi_flows_root[i],
-		     node_print_unknown_proto_walker, &thread_id);
+	  ndpi_workflow_walk_flows_shard(ndpi_thread_info[thread_id].workflow, i,
+					 node_print_known_proto_walker, &thread_id);
+	  ndpi_workflow_walk_flows_shard(ndpi_thread_info[thread_id].workflow, i,
+					 node_print_unknown_proto_walker, &thread_id);
 	}
       }
 
@@ -4523,10 +4528,11 @@ static void printResults(u_int64_t processing_time_usec, u_int64_t setup_time_us
       continue;
 
     for(i=0; i<NUM_ROOTS; i++) {
-      ndpi_twalk(ndpi_thread_info[thread_id].workflow->ndpi_flows_root[i],
-                 node_proto_guess_walker, &thread_id);
-      if(verbose == 3 || stats_flag) ndpi_twalk(ndpi_thread_info[thread_id].workflow->ndpi_flows_root[i],
-						port_stats_walker, &thread_id);
+      ndpi_workflow_walk_flows_shard(ndpi_thread_info[thread_id].workflow, i,
+				     node_proto_guess_walker, &thread_id);
+      if(verbose == 3 || stats_flag)
+	ndpi_workflow_walk_flows_shard(ndpi_thread_info[thread_id].workflow, i,
+				       port_stats_walker, &thread_id);
     }
 
     /* Stats aggregation */
@@ -5305,12 +5311,29 @@ static void ndpi_process_packet(u_char *args,
   ndpi_risk flow_risk;
   struct ndpi_flow_info *flow;
   u_int16_t thread_id = *((u_int16_t*)args);
+  u_int8_t stack_packet[2048];
+  u_int8_t *packet_checked = stack_packet;
 
-  /* allocate an exact size buffer to check overflows */
-  uint8_t *packet_checked = ndpi_malloc(header->caplen);
+  /*
+   * Most packets fit in the stack buffer. Jumbo packets use a per-thread
+   * object which is allocated at most once and reused by all following
+   * packets processed by this reader thread.
+   */
+  if(header->caplen > sizeof(stack_packet)) {
+    struct reader_thread *reader = &ndpi_thread_info[thread_id];
 
-  if(packet_checked == NULL) {
-    return ;
+    if(reader->packet_scratch_capacity < header->caplen) {
+      u_int8_t *new_scratch = (u_int8_t *)ndpi_realloc(reader->packet_scratch,
+						       header->caplen);
+
+      if(new_scratch == NULL)
+	return;
+
+      reader->packet_scratch = new_scratch;
+      reader->packet_scratch_capacity = header->caplen;
+    }
+
+    packet_checked = reader->packet_scratch;
   }
 
   memcpy(packet_checked, packet, header->caplen);
@@ -5323,19 +5346,20 @@ static void ndpi_process_packet(u_char *args,
   if(live_capture) {
     if(ndpi_thread_info[thread_id].last_idle_scan_time + IDLE_SCAN_PERIOD < ndpi_thread_info[thread_id].workflow->last_time) {
       /* scan for idle flows */
-      ndpi_twalk(ndpi_thread_info[thread_id].workflow->ndpi_flows_root[ndpi_thread_info[thread_id].idle_scan_idx],
-		 node_idle_scan_walker, &thread_id);
+      ndpi_workflow_walk_flows_shard(ndpi_thread_info[thread_id].workflow,
+				     ndpi_thread_info[thread_id].idle_scan_idx,
+				     node_idle_scan_walker, &thread_id);
 
       /* remove idle flows (unfortunately we cannot do this inline) */
       while(ndpi_thread_info[thread_id].num_idle_flows > 0) {
-	/* search and delete the idle flow from the "ndpi_flow_root" (see struct reader thread) - here flows are the node of a b-tree */
-	ndpi_tdelete(ndpi_thread_info[thread_id].idle_flows[--ndpi_thread_info[thread_id].num_idle_flows],
-		     &ndpi_thread_info[thread_id].workflow->ndpi_flows_root[ndpi_thread_info[thread_id].idle_scan_idx],
-		     ndpi_workflow_node_cmp);
+	/* Remove the idle flow from the open-addressing table. */
+	struct ndpi_flow_info *idle =
+	  ndpi_thread_info[thread_id].idle_flows[--ndpi_thread_info[thread_id].num_idle_flows];
+	ndpi_workflow_remove_flow(ndpi_thread_info[thread_id].workflow, idle);
 
 	/* free the memory associated to idle flow in "idle_flows" - (see struct reader thread)*/
-	ndpi_free_flow_info_half(ndpi_thread_info[thread_id].idle_flows[ndpi_thread_info[thread_id].num_idle_flows]);
-	ndpi_free(ndpi_thread_info[thread_id].idle_flows[ndpi_thread_info[thread_id].num_idle_flows]);
+	ndpi_free_flow_info_half(idle);
+	ndpi_free(idle);
       }
 
       if(++ndpi_thread_info[thread_id].idle_scan_idx == ndpi_thread_info[thread_id].workflow->prefs.num_roots)
@@ -5443,7 +5467,6 @@ static void ndpi_process_packet(u_char *args,
 	   thread_id, (unsigned long)ndpi_thread_info[thread_id].workflow->stats.raw_packet_count, header->caplen);
 
   if((u_int32_t)(pcap_end.tv_sec-pcap_start.tv_sec) > pcap_analysis_duration) {
-    unsigned int i;
     u_int64_t processing_time_usec, setup_time_usec;
 
     gettimeofday(&end, NULL);
@@ -5452,10 +5475,7 @@ static void ndpi_process_packet(u_char *args,
 
     printResults(processing_time_usec, setup_time_usec);
 
-    for(i=0; i<ndpi_thread_info[thread_id].workflow->prefs.num_roots; i++) {
-      ndpi_tdestroy(ndpi_thread_info[thread_id].workflow->ndpi_flows_root[i], ndpi_flow_info_freer);
-      ndpi_thread_info[thread_id].workflow->ndpi_flows_root[i] = NULL;
-    }
+    ndpi_workflow_clear_flows(ndpi_thread_info[thread_id].workflow);
     ndpi_stats_reset(&ndpi_thread_info[thread_id].workflow->stats);
 
     if(!quiet_mode)
@@ -5465,14 +5485,6 @@ static void ndpi_process_packet(u_char *args,
     memcpy(&pcap_start, &pcap_end, sizeof(pcap_start));
   }
 
-  /*
-    Leave the free as last statement to avoid crashes when ndpi_detection_giveup()
-    is called above by printResults()
-  */
-  if(packet_checked) {
-    ndpi_free(packet_checked);
-    packet_checked = NULL;
-  }
 }
 
 
